@@ -151,7 +151,7 @@ Maps JSON to DTO for the application.
 ## 7. Step-by-Step Explanation of Each Method
 
 ### 7.1 Upload Audio — UploadFileAsync
-Sends raw audio stream to POST /v2/upload.
+Sends raw audio stream to ```POST /v2/upload```.
 
 Returns upload_url for transcription.
 
@@ -166,7 +166,7 @@ Body sent to AssemblyAI:
   "speaker_labels": true
 }
 ```
-Calls POST /v2/transcript.
+Calls ```"POST /v2/transcript".```
 
 Receives transcript_id.
 
@@ -194,15 +194,47 @@ Polling interval: 3 seconds
 - Retry only on transient conditions (network exceptions, 5xx, 429). Do not retry non-retryable 4xx errors.
 - When retrying uploads, prefer chunked/resumable upload fallback to avoid re-sending entire file.
 
-**Sample pseudocode** (see POC appendix for a full C# implementation):
+**Sample pseudocode:** 
 
 ```csharp
-// high-level
-try {
-  uploadUrl = await RetryHelper.RetryAsync(() => UploadFileAsync(stream));
-} catch {
-  // fallback: chunked upload
-  uploadUrl = await TryChunkedUploadFallbackAsync(stream);
+    try
+    {
+        // Rewind if possible; previous attempt may have consumed the stream.
+        if (fileStream.CanSeek)
+            fileStream.Seek(0, SeekOrigin.Begin);
+
+        var uploadUrl = await UploadSingleAttemptAsync(fileStream, ct);
+        if (!string.IsNullOrWhiteSpace(uploadUrl))
+            return uploadUrl;
+
+        // Treat empty upload_url as non-retryable logic error
+        lastException = new InvalidOperationException("Upload returned empty upload_url.");
+        break;
+    }
+    catch (InvalidOperationException ex)
+    {
+        // Consider InvalidOperationException as non-retryable client error (e.g., 4xx propagated)
+        lastException = ex;
+        break;
+    }
+    catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
+    {
+        // Timeout – retry
+        lastException = ex;
+        await BackoffDelayAsync(attempts, baseDelayMs, rng, ct);
+    }
+    catch (HttpRequestException ex)
+    {
+        // Transient network/server – retry
+        lastException = ex;
+        await BackoffDelayAsync(attempts, baseDelayMs, rng, ct);
+    }
+    catch (Exception ex)
+    {
+        // Other transient failures – retry
+        lastException = ex;
+        await BackoffDelayAsync(attempts, baseDelayMs, rng, ct);
+    }
 }
 ```
 

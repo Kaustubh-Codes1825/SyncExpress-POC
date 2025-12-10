@@ -1,10 +1,10 @@
-// src/components/RenderTranscript.tsx
 import { useEffect, useRef, useState } from "react";
 import { useVideoStore } from "../store/VideoStore";
 
 interface TranscriptRow {
   sentence: string;
   start: number; // milliseconds
+  end: number;
   confidence: number;
   speaker: string;
   timestamps?: { at: number; note?: string }[];
@@ -13,26 +13,24 @@ interface TranscriptRow {
 const RenderTranscript = () => {
   const [transcript, setTranscript] = useState<TranscriptRow[]>([]);
   const [editMode, setEditMode] = useState(false);
-  const [editingIndex, setEditingIndex] = useState<number | null>(null); // inline edit index
-  const [editingText, setEditingText] = useState("");
+  // edit mode manual highlight (null when none)
+  const [editHighlightIndex, setEditHighlightIndex] = useState<number | null>(null);
+
   const currentTime = useVideoStore((state) => state.currentTime); // ms
   const videoRef = useVideoStore((state) => state.videoRef);
 
-  // -- Edit-mode manual highlight (when editMode === true we use this)
-  const [editHighlightIndex, setEditHighlightIndex] = useState<number | null>(null);
-
-  // refs for stable transcript access and timers
+  // keep ref copy to avoid stale closures in key handlers
   const transcriptRef = useRef<TranscriptRow[]>([]);
   useEffect(() => {
     transcriptRef.current = transcript;
   }, [transcript]);
 
-  // last captured flash + resume affordance
+  // flash + resume affordances
   const [lastCapturedIndex, setLastCapturedIndex] = useState<number | null>(null);
   const [showResumeIndex, setShowResumeIndex] = useState<number | null>(null);
   const captureFlashTimer = useRef<number | null>(null);
 
-  // play-range control: when playing a single sentence in edit mode we pause at endTimeSec
+  // restrict playback to a sentence end when playing a single sentence in edit mode
   const playRangeEndRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -51,22 +49,22 @@ const RenderTranscript = () => {
     loadTranscript();
   }, []);
 
-  // activeIndex (view mode) - only used when editMode === false
+  // view-mode active index (based on currentTime)
   const activeIndex = transcript.findIndex((item, idx) => {
     const start = item.start ?? 0;
     const nextStart = transcript[idx + 1]?.start ?? Infinity;
     return currentTime >= start && currentTime < nextStart;
   });
 
-  // helper: compute end time (seconds) for sentence index (next.start or video.duration)
+  // helper: compute end seconds of sentence idx (next.start or video.duration)
   const computeSentenceEndSeconds = (idx: number) => {
     if (!transcript[idx]) return videoRef?.current?.duration ?? 0;
     const nextStartMs = transcript[idx + 1]?.start ?? null;
     if (nextStartMs != null) return nextStartMs / 1000;
-    return videoRef?.current?.duration ?? (transcript[idx].start / 1000 + 5); // fallback
+    return videoRef?.current?.duration ?? (transcript[idx].start / 1000 + 5);
   };
 
-  // play only a single sentence (seek to start, play, and enforce a pause when reaching sentence end).
+  // play single sentence: sets playRangeEndRef so we pause at end
   const playSingleSentence = (idx: number) => {
     const line = transcript[idx];
     if (!line || !videoRef?.current) return;
@@ -77,23 +75,19 @@ const RenderTranscript = () => {
     videoRef.current.play().catch(() => {});
   };
 
-  // generic play from timestamp (used for timestamp chips)
   const handlePlayFromTimestamp = (ms: number) => {
     if (!videoRef?.current) return;
-    playRangeEndRef.current = null; // not restricting range when playing arbitrary timestamp
+    playRangeEndRef.current = null;
     videoRef.current.currentTime = ms / 1000;
     videoRef.current.play().catch(() => {});
   };
 
-  // when clicking a sentence:
-  // - in Edit Mode: highlight the clicked sentence and play only that sentence
-  // - in View Mode: seek & play normally (and auto-highlighting will follow)
+  // click a sentence
   const handleClick = (idx: number) => {
     if (editMode) {
       setEditHighlightIndex(idx);
       playSingleSentence(idx);
     } else {
-      // view behavior
       const line = transcript[idx];
       if (!line || !videoRef?.current) return;
       playRangeEndRef.current = null;
@@ -102,56 +96,18 @@ const RenderTranscript = () => {
     }
   };
 
-  // inline edit lifecycle
-  const startEditing = (idx: number) => {
-    setEditingIndex(idx);
-    setEditingText(transcript[idx].sentence);
-    try { videoRef?.current?.pause(); } catch {}
-  };
-  const saveEdit = () => {
-    if (editingIndex == null) return;
+  // remove a single timestamp entry (lineIdx, tsIdx)
+  const removeTimestamp = (lineIdx: number, tsIdx: number) => {
     setTranscript((prev) => {
-      const copy = prev.map((r) => ({ ...r }));
-      copy[editingIndex] = { ...copy[editingIndex], sentence: editingText };
+      const copy = prev.map((r) => ({ ...r, timestamps: Array.isArray(r.timestamps) ? [...r.timestamps] : [] }));
+      const line = copy[lineIdx];
+      if (!line || !Array.isArray(line.timestamps) || tsIdx < 0 || tsIdx >= line.timestamps.length) return prev;
+      line.timestamps.splice(tsIdx, 1);
       return copy;
-    });
-    setEditingIndex(null);
-    setEditingText("");
-  };
-  const cancelEdit = () => {
-    setEditingIndex(null);
-    setEditingText("");
-  };
-
-  const deleteLine = (idx: number) => {
-    const item = transcript[idx];
-    if (!item) return;
-    const ok = window.confirm("Delete this line? This action cannot be undone.");
-    if (!ok) return;
-    setTranscript((prev) => {
-      const copy = prev.slice();
-      copy.splice(idx, 1);
-      return copy;
-    });
-    if (editingIndex === idx) {
-      setEditingIndex(null);
-      setEditingText("");
-    } else if (editingIndex != null && idx < editingIndex) {
-      setEditingIndex((prev) => (prev != null ? prev - 1 : prev));
-    }
-    // if we deleted the highlighted sentence, move highlight forward safely
-    setEditHighlightIndex((cur) => {
-      if (cur == null) return cur;
-      if (idx === cur) return null;
-      if (idx < cur) return cur - 1;
-      return cur;
     });
   };
 
-  // Spacebar handler in Edit Mode:
-  // - append timestamp to the highlighted sentence,
-  // - pause video,
-  // - advance highlight to next sentence and start playing that sentence.
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const tag = document.activeElement?.tagName;
@@ -159,7 +115,7 @@ const RenderTranscript = () => {
       if (tag === "INPUT" || tag === "TEXTAREA" || activeEl?.isContentEditable) return;
 
       if (e.code === "Space" || e.key === " ") {
-        if (!editMode) return; // only active in edit mode
+        if (!editMode) return;
         e.preventDefault();
 
         const video = videoRef?.current;
@@ -168,7 +124,7 @@ const RenderTranscript = () => {
           return;
         }
 
-        // current highlighted sentence; if none, fall back to compute active from playhead
+        // decide which sentence to attach to: prefer manual highlight, else find by playhead
         const idx = editHighlightIndex ?? transcriptRef.current.findIndex((item, i) => {
           const s = item.start ?? 0;
           const next = transcriptRef.current[i + 1]?.start ?? Infinity;
@@ -182,7 +138,7 @@ const RenderTranscript = () => {
 
         const ms = Math.round(video.currentTime * 1000);
 
-        // attach timestamp to that line
+        // append timestamp to that line
         setTranscript((prev) => {
           const copy = prev.map((r) => ({ ...r, timestamps: Array.isArray(r.timestamps) ? [...r.timestamps] : [] }));
           const line = copy[idx];
@@ -194,12 +150,10 @@ const RenderTranscript = () => {
         // pause video
         try { video.pause(); } catch (err) { console.warn("Failed to pause video after capture:", err); }
 
-        // flash + resume affordance (flash for UI feedback)
+        // flash + resume affordance
         setLastCapturedIndex(idx);
         setShowResumeIndex(idx);
-        if (captureFlashTimer.current) {
-          window.clearTimeout(captureFlashTimer.current);
-        }
+        if (captureFlashTimer.current) window.clearTimeout(captureFlashTimer.current);
         captureFlashTimer.current = window.setTimeout(() => {
           setLastCapturedIndex(null);
           captureFlashTimer.current = null;
@@ -209,10 +163,8 @@ const RenderTranscript = () => {
         const nextIdx = idx + 1;
         if (nextIdx < transcriptRef.current.length) {
           setEditHighlightIndex(nextIdx);
-          // short delay to ensure pause has taken effect visually
           setTimeout(() => playSingleSentence(nextIdx), 120);
         } else {
-          // no next sentence — clear highlight
           setEditHighlightIndex(null);
         }
       }
@@ -222,13 +174,13 @@ const RenderTranscript = () => {
     return () => window.removeEventListener("keydown", handler);
   }, [editMode, videoRef, editHighlightIndex]);
 
-  // Enforce playRangeEndRef: pause the video when currentTime reaches end of single-sentence play range
+  // enforce playRangeEndRef: pause when reach end of sentence
   useEffect(() => {
     const video = videoRef?.current;
     if (!video) return;
     const onTimeUpdate = () => {
       const end = playRangeEndRef.current;
-      if (end != null && video.currentTime >= end - 0.02) { // tiny epsilon
+      if (end != null && video.currentTime >= end - 0.02) {
         try { video.pause(); } catch {}
         playRangeEndRef.current = null;
       }
@@ -242,17 +194,13 @@ const RenderTranscript = () => {
     const line = transcript[idx];
     if (!line) return;
     const lastTs = line.timestamps && line.timestamps.length ? line.timestamps[line.timestamps.length - 1].at : line.start;
-    // Behavior:
-    // - If in edit mode and this line is highlighted, play only this sentence.
     if (editMode && editHighlightIndex === idx) {
-      // play single sentence from last captured timestamp if present else from sentence start
       const startSec = (lastTs ?? line.start) / 1000;
       const endSec = computeSentenceEndSeconds(idx);
       playRangeEndRef.current = endSec;
       videoRef.current.currentTime = startSec;
       videoRef.current.play().catch(() => {});
     } else {
-      // generic resume: go to last ts and play
       playRangeEndRef.current = null;
       videoRef.current.currentTime = (lastTs ?? line.start) / 1000;
       videoRef.current.play().catch(() => {});
@@ -260,12 +208,6 @@ const RenderTranscript = () => {
     setShowResumeIndex(null);
     setLastCapturedIndex(null);
   };
-
-  // auto-focus editing input
-  const editInputRef = useRef<HTMLInputElement | null>(null);
-  useEffect(() => {
-    if (editingIndex != null) setTimeout(() => editInputRef.current?.focus(), 50);
-  }, [editingIndex]);
 
   const getConfidenceColor = (confidence: number) => {
     if (confidence < 50) return "bg-red-200 text-red-800";
@@ -278,22 +220,28 @@ const RenderTranscript = () => {
       <div className="flex items-center justify-between mb-3">
         <div>
           <label className="flex items-center gap-2">
-            <input type="checkbox" checked={editMode} onChange={(e) => { setEditMode(e.target.checked); setEditingIndex(null); setEditHighlightIndex(null); }} />
+            <input
+              type="checkbox"
+              checked={editMode}
+              onChange={(e) => { setEditMode(e.target.checked); setEditHighlightIndex(null); }}
+            />
             <span className="text-sm">Edit Mode</span>
           </label>
         </div>
 
         <div className="text-sm text-gray-600">
-          {editMode ? "Edit Mode: click a sentence to play only that sentence. Press Space to capture timestamp, advance to next." : "View Mode: click a sentence to play (auto-highlighting enabled)."}
+          {editMode
+            ? "Edit Mode: click a sentence to play only that sentence. Press Space to capture timestamp; it will pause and advance to the next sentence."
+            : "View Mode: click a sentence to play (auto-highlighting enabled)."}
         </div>
       </div>
 
       <div className="p-4 max-h-[70vh] overflow-y-auto space-y-2">
         {transcript.map((item, idx) => {
-          // highlight logic: in edit mode use editHighlightIndex, otherwise use activeIndex from currentTime
+          // highlight logic: use manual editHighlightIndex in editMode, otherwise activeIndex
           const isHighlighted = editMode ? (editHighlightIndex === idx) : (activeIndex === idx);
           const startSeconds = (item.start / 1000).toFixed(3);
-          const isEditingThis = editingIndex === idx;
+          const endSeconds = (item.end/1000).toFixed(3);
           const justCaptured = lastCapturedIndex === idx;
           const showResume = showResumeIndex === idx;
 
@@ -305,26 +253,15 @@ const RenderTranscript = () => {
               data-line-index={idx}
             >
               <div className="flex justify-between items-center gap-2 mb-1">
-                {/* Show start time only in view mode; in edit mode hide start time (per request) */}
+                
                 {!editMode ? (
                   <span className="text-sm font-mono">{startSeconds}s</span>
                 ) : (
-                  <span className="text-sm text-gray-400 italic">Edit Mode: start hidden</span>
+                  <span className="text-sm text-red-400 italic">{startSeconds}s - {endSeconds}s</span>
                 )}
 
                 <div className="flex-1 px-2">
-                  {isEditingThis ? (
-                    <input
-                      ref={editInputRef}
-                      value={editingText}
-                      onChange={(e) => setEditingText(e.target.value)}
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onClick={(e) => e.stopPropagation()}
-                      className="w-full p-1 border rounded-md"
-                    />
-                  ) : (
-                    <span>{item.sentence}</span>
-                  )}
+                  <span>{item.sentence}</span>
                 </div>
 
                 <div className={`text-sm font-medium px-2 py-0.5 rounded ${getConfidenceColor(item.confidence)}`}>{item.confidence}%</div>
@@ -339,13 +276,19 @@ const RenderTranscript = () => {
                       item.timestamps.map((ts, tsi) => (
                         <div key={tsi} className="flex items-center gap-2 text-xs bg-gray-100 rounded-full px-2 py-1">
                           <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handlePlayFromTimestamp(ts.at);
-                            }}
+                            onClick={(e) => { e.stopPropagation(); handlePlayFromTimestamp(ts.at); }}
                             className="underline"
                           >
                             {(ts.at / 1000).toFixed(3)}s
+                          </button>
+
+                          {/* cross icon to remove this timestamp */}
+                          <button
+                            onClick={(e) => { e.stopPropagation(); removeTimestamp(idx, tsi); }}
+                            title="Remove timestamp"
+                            className="ml-1 text-xs rounded-full w-5 h-5 flex items-center justify-center text-gray-600 hover:bg-gray-200"
+                          >
+                            ×
                           </button>
                         </div>
                       ))
@@ -363,8 +306,7 @@ const RenderTranscript = () => {
                         Listen
                       </button>
 
-                      
-
+                      {/* Resume button after capture */}
                       {showResume && (
                         <button
                           onClick={(e) => { e.stopPropagation(); handleResume(idx); }}
@@ -377,7 +319,6 @@ const RenderTranscript = () => {
                   )}
 
                   {!editMode && (
-                    // when not in edit mode we still show a Resume button if available
                     showResume && (
                       <button
                         onClick={(e) => { e.stopPropagation(); handleResume(idx); }}
