@@ -41,10 +41,6 @@ namespace Transcription.Services
             _http.Timeout = TimeSpan.FromMinutes(5);
         }
 
-        /// <summary>
-        /// Orchestrates: upload (with retry) -> create transcript -> poll -> map to DTO.
-        /// Handles files only. If the incoming stream isn't seekable, it buffers once so retries are possible.
-        /// </summary>
         public async Task<SimpleTranscriptDto> TranscribeFileAsync(Stream fileStream, CancellationToken ct = default)
         {
             if (fileStream == null || !fileStream.CanRead)
@@ -67,9 +63,6 @@ namespace Transcription.Services
             return MapToDto(rawJson);
         }
 
-        /// <summary>
-        /// Creates a transcript job using the upload_url, returns transcript id.
-        /// </summary>
         public async Task<string> CreateTranscriptAsync(string audioUrl, CancellationToken ct = default)
         {
             var body = new
@@ -97,9 +90,6 @@ namespace Transcription.Services
             return id!;
         }
 
-        /// <summary>
-        /// Polls transcript status until "completed" or throws on "error".
-        /// </summary>
         public async Task<JsonElement> WaitForTranscriptAsync(string transcriptId, CancellationToken ct = default)
         {
             while (true)
@@ -136,9 +126,7 @@ namespace Transcription.Services
             }
         }
 
-        /// <summary>
-        /// Maps AssemblyAI JSON to your DTO. Adjust fields as needed.
-        /// </summary>
+
         public SimpleTranscriptDto MapToDto(JsonElement root)
         {
             var dto = new SimpleTranscriptDto();
