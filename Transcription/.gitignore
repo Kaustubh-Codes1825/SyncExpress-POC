@@ -1,0 +1,40 @@
+# Build Folders
+bin/
+obj/
+Debug/
+Release/
+ 
+# Visual Studio files
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+ 
+# Rider / JetBrains
+.idea/
+*.iml
+ 
+# NuGet
+*.nupkg
+packages/
+# Package restore
+*.nuget.props
+*.nuget.targets
+ 
+# Others
+*.log
+*.tlog
+*.tmp
+*.cache
+*.pdb
+*.mdb
+ 
+# OS generated files
+Thumbs.db
+.DS_Store
+
+
+Task_Manager/
+appsettings.json
+appsettings.Development.json
