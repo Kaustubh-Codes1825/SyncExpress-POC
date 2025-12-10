@@ -286,7 +286,7 @@ const RenderTranscript = () => {
                           <button
                             onClick={(e) => { e.stopPropagation(); removeTimestamp(idx, tsi); }}
                             title="Remove timestamp"
-                            className="ml-1 text-xs rounded-full w-5 h-5 flex items-center justify-center text-gray-600 hover:bg-gray-200"
+                            className="ml-1 text-xs rounded-full w-5 h-5 flex items-center justify-center text-red-800 hover:bg-gray-200"
                           >
                             ×
                           </button>

@@ -1,5 +1,13 @@
 # AssemblyAI Transcription POC Documentation
 
+### Author(s):
+- **Kaustubh Paul**
+
+
+### Submission Date:
+- **DD/MM/YYYY**
+
+
 ## 1. Overview
 This Proof of Concept (POC) demonstrates the implementation and workflow of integrating **AssemblyAI** into the backend (**C#/.NET**) to transcribe an audio file into structured text, including timestamps and confidence scores.  
 The structured transcript generated here will later be used in the **Autosync** feature for synchronizing text with video timelines.
@@ -8,7 +16,7 @@ This documentation includes:
 
 - Objectives  
 - End-to-end workflow  
-- API endpoints  "Kaustubh-Codes1825/Transcription"
+- API endpoints (Assembly AI + Swagger API)
 - A full Mermaid workflow diagram  
 - Backend implementation details  
 - JSON mapping  
@@ -44,7 +52,7 @@ The main objectives of this POC are:
 
 ## 4. API Planning (AssemblyAI + Swagger for Backend Service)
 
-### 4.1 AssemblyAI API Endpoints:
+### 4.1 External API Endpoints (AssemblyAI APIs):
 
 | Purpose | Method | Endpoint |
 |--------|--------|----------|
@@ -57,13 +65,13 @@ The main objectives of this POC are:
 authorization: <API_KEY>
 
 ---
-### 4.2 External API Endpoints(Swagger-Backend Service):
+### 4.2 Swagger-Backend Service:
 | Purpose | Method | Endpoint |
 |--------|--------|----------|
 | Sentence-level transcription | POST | `/api/transcription` |
-| Create transcription job | POST | `https://api.assemblyai.com/v2/transcript` |
-| Poll transcription status | GET | `https://api.assemblyai.com/v2/transcript/{id}` |
-| Fetch final result | GET | `https://api.assemblyai.com/v2/transcript/{id}` |
+| Word-level transcription (per-word timestamps, speaker labels, % confidence) | POST | `/api/transcription/words` |
+| Check if backend service is running | GET | `/api/health` |
+| Fetch supported transcription features | GET | `/api/transcription/features` |
 ---
 
 ## 5. Workflow Diagram 
@@ -155,43 +163,15 @@ Sends raw audio stream to ```POST /v2/upload```.
 
 Returns upload_url for transcription.
 
-### 7.2 Create Transcription Job — CreateTranscriptAsync
-Body sent to AssemblyAI:
-
-```json
-{
-  "audio_url": "<upload_url>",
-  "punctuate": true,
-  "format_text": true,
-  "speaker_labels": true
-}
-```
-Calls ```"POST /v2/transcript".```
-
-Receives transcript_id.
-
-### 7.3 Polling Logic — WaitForTranscriptAsync
-Calls:
-
-```bash
-GET /v2/transcript/{transcript_id}
-```
-Status values:
-
-- "queued" -> keep polling
-- "processing" -> keep polling
-- "completed" -> return final JSON
-- "error" -> stop and throw exception
-
-Polling interval: 3 seconds
-
-## Retry & Fallback (exponential backoff + jitter)
+### 7.2 Retry & Fallback (exponential backoff + jitter)
 
 **Strategy:** transient network failures and 5xx/429 responses are retried using exponential backoff + jitter. Retries are bounded; if retries are exhausted an alternative upload path (chunked/resumable or alternate storage) is attempted. All retry attempts are logged and exposed via metrics.
 
 **Implementation notes**
 - Use a Polly-based policy in production for robust, testable behavior. For small projects a custom RetryHelper (exponential backoff + jitter) is sufficient.
+
 - Retry only on transient conditions (network exceptions, 5xx, 429). Do not retry non-retryable 4xx errors.
+
 - When retrying uploads, prefer chunked/resumable upload fallback to avoid re-sending entire file.
 
 **Sample pseudocode:** 
@@ -213,7 +193,7 @@ Polling interval: 3 seconds
     }
     catch (InvalidOperationException ex)
     {
-        // Consider InvalidOperationException as non-retryable client error (e.g., 4xx propagated)
+        // Consider InvalidOperationException as non-retryable client error 
         lastException = ex;
         break;
     }
@@ -235,10 +215,42 @@ Polling interval: 3 seconds
         lastException = ex;
         await BackoffDelayAsync(attempts, baseDelayMs, rng, ct);
     }
-}
+
 ```
 
-### 7.4 JSON Mapping — MapToDto
+### 7.3 Create Transcription Job — CreateTranscriptAsync
+Body sent to AssemblyAI:
+
+```json
+{
+  "audio_url": "<upload_url>",
+  "punctuate": true,
+  "format_text": true,
+  "speaker_labels": true
+}
+```
+Calls ```"POST /v2/transcript".```
+
+Receives transcript_id.
+
+### 7.4 Polling Logic — WaitForTranscriptAsync
+Calls:
+
+```bash
+GET /v2/transcript/{transcript_id}
+```
+Status values:
+
+- "queued" -> keep polling
+- "processing" -> keep polling
+- "completed" -> return final JSON
+- "error" -> stop and throw exception
+
+Polling interval: 3 seconds
+
+
+
+### 7.5 JSON Mapping — MapToDto
 Extracts:
 
 - FullText (full transcript)
@@ -275,6 +287,22 @@ Contains list of `SentenceDto` items
 ```
 
 ---
+## 9. Risk & Mitigation Chart:
+
+| No. | Risk Category                                     | Description                                                                | Impact | Likelihood | Mitigation Strategy                                                                                                        |
+| --- | ------------------------------------------------- | -------------------------------------------------------------------------- | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **Network Failure During Large File Upload**      | Uploading large audio files may fail due to unstable network connectivity. | High   | Medium     | Implement **chunked/resumable uploads**, retries with exponential backoff, and fallback recovery.                          |
+| 2   | **AssemblyAI Service Downtime / Slow Response**   | External API may be unavailable or slow, delaying transcription.           | High   | Low        | Add retry logic, timeouts, and surface errors gracefully; implement fallback queue or delayed retry mechanism.             |
+| 3   | **Incorrect or Incomplete Transcript Output**     | Transcription accuracy may vary due to noise or unclear speech.            | Medium | Medium     | Apply **noise reduction**, guide users to upload clean audio, and use **confidence scores** to flag low-accuracy segments. |
+| 4   | **Exceeding API Rate Limits or Quotas**           | High-frequency uploads/polls may hit AssemblyAI rate limits.               | Medium | Medium     | Add rate-limit awareness, exponential backoff, scheduled polling, and batching strategies.                                 |
+| 5   | **Unexpected JSON Schema Changes**                | API updates may modify response structure, breaking mapping.               | Medium | Low        | Use defensive JSON parsing, add version validation, monitor documentation changes.                                         |
+| 6   | **File Format Not Supported or Corrupted Audio**  | Users may upload unsupported formats or damaged audio.                     | Low    | Medium     | Validate file format before upload; implement error handling to reject invalid audio early.                                |
+| 7   | **Long Transcription Times for Very Large Files** | Processing time may increase significantly for long videos.                | High   | Medium     | Optimize polling frequency, display progress indicators, and consider splitting audio logically.                           |
+| 8   | **Security Risk: API Key Exposure**               | API key leakage can compromise system security.                            | High   | Low        | Store keys in environment variables or secure vault; never expose them in frontend or logs.                                |
+| 9   | **Server Resource Overuse (Memory/CPU)**          | Large streams or repeated retries can strain backend resources.            | Medium | Medium     | Stream files efficiently, apply request limits, and monitor resource usage.                                                |
+| 10  | **Inaccurate Speaker Diarization**                | Model may misidentify speakers in overlapping speech.                      | Medium | Medium     | Allow manual correction in UI; use confidence scores; consider improved diarization models later.                          |
+
+---
 
 ## 9. Proposed Autosync Integration Workflow
 When audio extraction is ready:
@@ -290,10 +318,6 @@ When audio extraction is ready:
 
 
 ## Time Estimate Chart
-
-
-### Development Tasks & Estimates
-
 
 ### Development Tasks & Estimates
 
@@ -315,3 +339,4 @@ When audio extraction is ready:
 
 ## 10. Conclusion
 AssemblyAI transcription integrates seamlessly with C#, delivering accurate timestamps and confidence scores for every segment. The implementation ensures that the raw JSON response is efficiently mapped into clean, structured DTOs, making the data ready for downstream processing. This POC validates AssemblyAI as a reliable transcription engine and confirms its suitability for powering future Autosync functionality, enabling precise synchronization between audio and video timelines.
+
