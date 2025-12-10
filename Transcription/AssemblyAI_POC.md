@@ -17,11 +17,13 @@ This documentation includes:
 - Objectives  
 - End-to-end workflow  
 - API endpoints (Assembly AI + Swagger API)
-- A full Mermaid workflow diagram  
+- A full Workflow diagram  
 - Backend implementation details  
 - JSON mapping  
 - Test results  
-- Proposed Autosync integration workflow  
+- Risk and its Mitigations
+- Proposed Autosync integration workflow 
+- Time Estimate Chart 
 - Conclusion  
 
 ---
@@ -131,6 +133,7 @@ public AssemblyAIService(HttpClient httpClient, IOptions<AssemblyAiOptions> opti
 }
 ```
 
+
 ### 6.2 Orchestration Method - Full Transcription Flow
 ```csharp
 public async Task<SimpleTranscriptDto> TranscribeFileAsync(Stream fileStream)
@@ -216,6 +219,16 @@ Returns upload_url for transcription.
         await BackoffDelayAsync(attempts, baseDelayMs, rng, ct);
     }
 
+```
+
+On failing to upload it will show a messege.
+```csharp
+
+ var msg = $"Upload failed after {attempts} attempt(s).";
+ if (lastException != null)
+     throw new Exception(msg, lastException);
+
+  throw new Exception(msg);
 ```
 
 ### 7.3 Create Transcription Job — CreateTranscriptAsync
