@@ -1,351 +1,269 @@
-﻿
-using System;
+﻿using System;
 using System.IO;
-using System.Net;
 using System.Net.Http;
-using System.Text;
+using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Transcription.Interfaces;
 using Transcription.Models;
+using System.Collections.Generic;
+using Microsoft.AspNetCore.Http;
 
 namespace Transcription.Services
 {
-    public class AssemblyAIService
+    public class AssemblyAiService : ITranscriptionService
     {
-        private readonly HttpClient _http;
-        private readonly string _apiKey;
-        private readonly ILogger<AssemblyAIService>? _logger;
+        private readonly IHttpClientFactory _httpFactory;
+        private readonly AssemblyAiOptions _opts;
+        private readonly ILogger<AssemblyAiService> _logger;
+        private readonly JsonSerializerOptions _jsonOpts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
 
-        // AssemblyAI v2 endpoints
-        private const string UploadEndpoint = "https://api.assemblyai.com/v2/upload";
-        //private const string UploadEndpoint = "https://INVALID_HOST/upload";
-
-        private const string TranscriptBaseEndpoint = "https://api.assemblyai.com/v2/transcript";
-
-        public AssemblyAIService(
-            HttpClient httpClient,
-            IOptions<AssemblyAiOptions> options,
-            ILogger<AssemblyAIService>? logger = null)
+        public AssemblyAiService(IHttpClientFactory httpFactory, IOptions<AssemblyAiOptions> opts, ILogger<AssemblyAiService> logger)
         {
-            _http = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
-            _apiKey = options?.Value?.ApiKey ?? throw new ArgumentNullException(nameof(options.Value.ApiKey));
+            _httpFactory = httpFactory;
+            _opts = opts.Value;
             _logger = logger;
-
-            _http.DefaultRequestHeaders.Clear();
-            _http.DefaultRequestHeaders.Add("authorization", _apiKey);
-
-            // For large uploads, give enough time.
-            _http.Timeout = TimeSpan.FromMinutes(5);
         }
 
-        public async Task<SimpleTranscriptDto> TranscribeFileAsync(Stream fileStream, CancellationToken ct = default)
+        // New public entrypoint: accepts uploaded file
+        public async Task<SimpleTranscriptDto> TranscribeAsync(IFormFile file, CancellationToken ct = default)
         {
-            if (fileStream == null || !fileStream.CanRead)
-                throw new ArgumentException("Invalid audio stream.", nameof(fileStream));
+            if (file == null || file.Length == 0)
+                throw new ArgumentException("Uploaded file is null or empty.", nameof(file));
 
-            // Ensure we have a seekable stream for retries
-            Stream workingStream = fileStream;
-            if (!fileStream.CanSeek)
+            // create a secure temp file path (preserve extension if available)
+            var ext = Path.GetExtension(file.FileName);
+            if (string.IsNullOrEmpty(ext)) ext = ".bin";
+            var tmpPath = Path.Combine(Path.GetTempPath(), $"assemblyai_{Guid.NewGuid():N}{ext}");
+
+            try
             {
-                var buffer = new MemoryStream();
-                await fileStream.CopyToAsync(buffer, ct);
-                buffer.Position = 0;
-                workingStream = buffer;
+                // Save the IFormFile to disk
+                await using (var fs = new FileStream(tmpPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, useAsync: true))
+                {
+                    await file.CopyToAsync(fs, ct);
+                }
+
+                // Now call the internal flow that works with file path
+                var uploadUrl = await UploadFileAsync(tmpPath, ct);
+                var transcriptId = await CreateTranscriptAsync(uploadUrl, ct);
+                var root = await PollTranscriptAsync(transcriptId, ct);
+
+                var dto = MapTranscript(root);
+                dto.RawJson = JsonSerializer.Serialize(root, _jsonOpts);
+                return dto;
+            }
+            finally
+            {
+                // Always attempt cleanup (best-effort)
+                try
+                {
+                    if (File.Exists(tmpPath)) File.Delete(tmpPath);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to delete temp file {Path}", tmpPath);
+                }
+            }
+        }
+
+        // Upload helper that reads the file from disk (no streaming public API)
+        private async Task<string> UploadFileAsync(string filePath, CancellationToken ct)
+        {
+            var client = _httpFactory.CreateClient("assemblyai");
+            var url = $"{_opts.BaseUrl.TrimEnd('/')}/upload";
+
+            await using var fs = File.OpenRead(filePath);
+            using var content = new StreamContent(fs);
+            content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+
+            using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+            var apiKey = (_opts.ApiKey ?? "").Trim();
+            req.Headers.Remove("authorization");
+            req.Headers.Add("authorization", apiKey);
+
+            _logger.LogDebug("Uploading file {File} to {Url}", filePath, url);
+
+            var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+            var body = await SafeRead(resp, ct);
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                _logger.LogError("Upload failed {Status} {Body}", (int)resp.StatusCode, Truncate(body, 500));
+                throw new InvalidOperationException($"Upload failed: {body}");
             }
 
-            var uploadUrl = await UploadToAssemblyAiWithRetryAsync(workingStream, maxRetries: 3, baseDelayMs: 500, ct);
-            var transcriptId = await CreateTranscriptAsync(uploadUrl, ct);
-            var rawJson = await WaitForTranscriptAsync(transcriptId, ct);
-
-            return MapToDto(rawJson);
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("upload_url", out var up))
+                return up.GetString() ?? throw new InvalidOperationException("Upload returned empty upload_url.");
+            throw new InvalidOperationException("Upload response missing upload_url.");
         }
 
-        public async Task<string> CreateTranscriptAsync(string audioUrl, CancellationToken ct = default)
+        // The rest of the service (CreateTranscriptAsync, PollTranscriptAsync, MapTranscript, helpers)
+        // can remain identical to previous implementation — they expect uploadUrl and use request-level auth.
+        // For brevity, paste the previously working methods here (CreateTranscriptAsync, PollTranscriptAsync, MapTranscript, FormatMs, SafeRead, Truncate)
+
+        private async Task<string> CreateTranscriptAsync(string uploadUrl, CancellationToken ct)
         {
+            var client = _httpFactory.CreateClient("assemblyai");
+            var url = $"{_opts.BaseUrl.TrimEnd('/')}/transcript";
+
             var body = new
             {
-                audio_url = audioUrl,
+                audio_url = uploadUrl,
+                speaker_labels = true,
                 punctuate = true,
-                format_text = true,
-                speaker_labels = true
+                format_text = true
             };
 
-            var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
-            var response = await _http.PostAsync(TranscriptBaseEndpoint, content, ct);
-
-            if (!response.IsSuccessStatusCode)
+            using var req = new HttpRequestMessage(HttpMethod.Post, url)
             {
-                var errorText = await SafeReadBodyAsync(response, ct);
-                _logger?.LogError("CreateTranscript failed: {Status} {Reason}. Body: {Body}",
-                    (int)response.StatusCode, response.ReasonPhrase, Truncate(errorText, 500));
-                throw new InvalidOperationException($"AssemblyAI error creating transcript: {errorText}");
+                Content = new StringContent(JsonSerializer.Serialize(body))
+            };
+            req.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+
+            var apiKey = (_opts.ApiKey ?? "").Trim();
+            req.Headers.Remove("authorization");
+            req.Headers.Add("authorization", apiKey);
+
+            var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+            var text = await SafeRead(resp, ct);
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                _logger.LogError("Create transcript failed {Status}: {Body}", (int)resp.StatusCode, Truncate(text, 500));
+                throw new InvalidOperationException($"Create transcript failed: {text}");
             }
 
-            var json = await response.Content.ReadAsStringAsync(ct);
-            using var doc = JsonDocument.Parse(json);
-            var id = doc.RootElement.GetProperty("id").GetString();
-            return id!;
+            using var doc = JsonDocument.Parse(text);
+            if (doc.RootElement.TryGetProperty("id", out var idp))
+                return idp.GetString() ?? throw new InvalidOperationException("Transcript create returned empty id.");
+            throw new InvalidOperationException("Transcript create returned unexpected payload.");
         }
 
-        public async Task<JsonElement> WaitForTranscriptAsync(string transcriptId, CancellationToken ct = default)
+        private async Task<JsonElement> PollTranscriptAsync(string transcriptId, CancellationToken ct)
         {
-            while (true)
+            var client = _httpFactory.CreateClient("assemblyai");
+            var url = $"{_opts.BaseUrl.TrimEnd('/')}/transcript/{transcriptId}";
+            var overallTimeout = TimeSpan.FromSeconds(_opts.OverallTimeoutSeconds);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            while (!ct.IsCancellationRequested)
             {
-                await Task.Delay(3000, ct); // poll every 3s
+                await Task.Delay(_opts.PollIntervalMs, ct);
 
-                var response = await _http.GetAsync($"{TranscriptBaseEndpoint}/{transcriptId}", ct);
-                if (!response.IsSuccessStatusCode)
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                req.Headers.Remove("authorization");
+                req.Headers.Add("authorization", (_opts.ApiKey ?? "").Trim());
+
+                var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+                var body = await SafeRead(resp, ct);
+
+                if (!resp.IsSuccessStatusCode)
                 {
-                    var errorText = await SafeReadBodyAsync(response, ct);
-                    _logger?.LogError("Polling failed: {Status} {Reason}. Body: {Body}",
-                        (int)response.StatusCode, response.ReasonPhrase, Truncate(errorText, 500));
-                    throw new InvalidOperationException($"AssemblyAI error while polling transcript: {errorText}");
+                    _logger.LogError("Poll failed {Status}: {Body}", (int)resp.StatusCode, Truncate(body, 500));
+                    throw new InvalidOperationException($"Polling failed: {body}");
                 }
 
-                var json = await response.Content.ReadAsStringAsync(ct);
-                using var doc = JsonDocument.Parse(json);
-                var root = doc.RootElement;
-                var status = root.GetProperty("status").GetString();
+                using var doc = JsonDocument.Parse(body);
+                var root = doc.RootElement.Clone();
 
-                if (status == "completed")
+                if (root.TryGetProperty("status", out var s) && s.GetString() is string status)
                 {
-                    return root.Clone(); // survive after doc dispose
+                    if (status == "completed") return root;
+                    if (status == "error")
+                    {
+                        var msg = root.TryGetProperty("error", out var e) ? e.GetString() : "unknown";
+                        throw new InvalidOperationException($"Transcription error: {msg}");
+                    }
                 }
 
-                if (status == "error")
-                {
-                    var errorMsg = root.GetProperty("error").GetString();
-                    _logger?.LogError("Transcription error: {Error}", errorMsg);
-                    throw new InvalidOperationException($"AssemblyAI transcription error: {errorMsg}");
-                }
-
-                // queued/processing → continue
+                if (sw.Elapsed > overallTimeout)
+                    throw new TimeoutException("Timed out waiting for transcription.");
             }
+
+            throw new OperationCanceledException("Polling cancelled.");
         }
 
-
-        public SimpleTranscriptDto MapToDto(JsonElement root)
+        private SimpleTranscriptDto MapTranscript(JsonElement root)
         {
             var dto = new SimpleTranscriptDto();
 
-            // Full text
             if (root.TryGetProperty("text", out var textProp))
-            {
-                dto.FullText = textProp.GetString() ?? string.Empty;
-            }
+                dto.FullText = textProp.GetString() ?? "";
 
-            // Utterances -> treat as sentences with speaker
-            if (root.TryGetProperty("utterances", out var uttProp) &&
-                uttProp.ValueKind == JsonValueKind.Array)
+            if (root.TryGetProperty("utterances", out var uttArr) && uttArr.ValueKind == JsonValueKind.Array)
             {
-                foreach (var u in uttProp.EnumerateArray())
+                foreach (var u in uttArr.EnumerateArray())
                 {
-                    var sentence = new SentenceDto
+                    var s = new SentenceDTO
                     {
-                        Speaker = u.TryGetProperty("speaker", out var spProp) ? spProp.GetString() ?? string.Empty : string.Empty,
-                        Text = u.TryGetProperty("text", out var tProp) ? tProp.GetString() ?? string.Empty : string.Empty
+                        Speaker = u.TryGetProperty("speaker", out var sp) ? sp.GetString() ?? "" : "",
+                        Text = u.TryGetProperty("text", out var t) ? t.GetString() ?? "" : "",
+                        Confidence = u.TryGetProperty("confidence", out var c) && c.ValueKind == JsonValueKind.Number ? $"{c.GetSingle() * 100:0.0}%" : null
                     };
 
-                    // Start
-                    if (u.TryGetProperty("start", out var sProp) && sProp.ValueKind == JsonValueKind.Number)
-                    {
-                        int startMs = sProp.GetInt32();
-                        sentence.StartTime = FormatTime(startMs);
-                    }
+                    if (u.TryGetProperty("start", out var sStart) && sStart.ValueKind == JsonValueKind.Number)
+                        s.Start = FormatMs(sStart.GetInt32());
+                    if (u.TryGetProperty("end", out var sEnd) && sEnd.ValueKind == JsonValueKind.Number)
+                        s.End = FormatMs(sEnd.GetInt32());
 
-                    // End
-                    if (u.TryGetProperty("end", out var eProp) && eProp.ValueKind == JsonValueKind.Number)
-                    {
-                        int endMs = eProp.GetInt32();
-                        sentence.EndTime = FormatTime(endMs);
-                    }
+                    dto.Sentences.Add(s);
 
-                    // Confidence
-                    if (u.TryGetProperty("confidence", out var cProp) && cProp.ValueKind == JsonValueKind.Number)
+                    if (u.TryGetProperty("words", out var wordsArr) && wordsArr.ValueKind == JsonValueKind.Array)
                     {
-                        float conf = cProp.GetSingle();
-                        sentence.ConfidencePercent = FormatConfidence(conf);
+                        foreach (var w in wordsArr.EnumerateArray())
+                        {
+                            var wd = new WordDTO
+                            {
+                                Text = w.TryGetProperty("text", out var wt) ? wt.GetString() ?? "" : "",
+                                Speaker = w.TryGetProperty("speaker", out var wsp) ? wsp.GetString() ?? "" : s.Speaker,
+                                Start = w.TryGetProperty("start", out var ws) && ws.ValueKind == JsonValueKind.Number ? ws.GetInt32() : 0,
+                                End = w.TryGetProperty("end", out var we) && we.ValueKind == JsonValueKind.Number ? we.GetInt32() : 0,
+                                Confidence = w.TryGetProperty("confidence", out var wc) && wc.ValueKind == JsonValueKind.Number ? wc.GetSingle() : 0f
+                            };
+                            dto.Words.Add(wd);
+                        }
                     }
-
-                    dto.Sentences.Add(sentence);
+                }
+            }
+            else if (root.TryGetProperty("words", out var topWords) && topWords.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var w in topWords.EnumerateArray())
+                {
+                    var wd = new WordDTO
+                    {
+                        Text = w.TryGetProperty("text", out var wt) ? wt.GetString() ?? "" : "",
+                        Speaker = w.TryGetProperty("speaker", out var wsp) ? wsp.GetString() ?? "" : "",
+                        Start = w.TryGetProperty("start", out var ws) && ws.ValueKind == JsonValueKind.Number ? ws.GetInt32() : 0,
+                        End = w.TryGetProperty("end", out var we) && we.ValueKind == JsonValueKind.Number ? we.GetInt32() : 0,
+                        Confidence = w.TryGetProperty("confidence", out var wc) && wc.ValueKind == JsonValueKind.Number ? wc.GetSingle() : 0f
+                    };
+                    dto.Words.Add(wd);
                 }
             }
 
             return dto;
         }
 
-        private async Task<string> UploadToAssemblyAiWithRetryAsync(
-            Stream fileStream,
-            int maxRetries = 3,
-            int baseDelayMs = 500,
-            CancellationToken ct = default)
+        private static string FormatMs(int ms)
         {
-            if (fileStream == null || !fileStream.CanRead)
-                throw new ArgumentException("Invalid audio stream.", nameof(fileStream));
-
-            int attempts = 0;
-            var rng = new Random();
-            Exception? lastException = null;
-
-            while (attempts < maxRetries)
-            {
-                attempts++;
-
-                try
-                {
-                    // Rewind if possible; previous attempt may have consumed the stream.
-                    if (fileStream.CanSeek)
-                        fileStream.Seek(0, SeekOrigin.Begin);
-
-                    var uploadUrl = await UploadSingleAttemptAsync(fileStream, ct);
-                    if (!string.IsNullOrWhiteSpace(uploadUrl))
-                        return uploadUrl;
-
-                    // Treat empty upload_url as non-retryable logic error
-                    lastException = new InvalidOperationException("Upload returned empty upload_url.");
-                    break;
-                }
-                catch (InvalidOperationException ex)
-                {
-                    // Consider InvalidOperationException as non-retryable client error (e.g., 4xx propagated)
-                    lastException = ex;
-                    break;
-                }
-                catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
-                {
-                    // Timeout – retry
-                    lastException = ex;
-                    await BackoffDelayAsync(attempts, baseDelayMs, rng, ct);
-                }
-                catch (HttpRequestException ex)
-                {
-                    // Transient network/server – retry
-                    lastException = ex;
-                    await BackoffDelayAsync(attempts, baseDelayMs, rng, ct);
-                }
-                catch (Exception ex)
-                {
-                    // Other transient failures – retry
-                    lastException = ex;
-                    await BackoffDelayAsync(attempts, baseDelayMs, rng, ct);
-                }
-            }
-
-            var msg = $"Upload failed after {attempts} attempt(s).";
-            if (lastException != null)
-                throw new Exception(msg, lastException);
-
-            throw new Exception(msg);
+            var t = TimeSpan.FromMilliseconds(ms);
+            return $"{t.Minutes:D2}:{t.Seconds:D2}.{t.Milliseconds:D3}";
         }
 
-        private async Task<string> UploadSingleAttemptAsync(Stream fileStream, CancellationToken ct)
+        private static async Task<string> SafeRead(HttpResponseMessage resp, CancellationToken ct)
         {
-            // Set a plausible MIME; some servers are picky.
-            var content = new StreamContent(fileStream);
-            content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("audio/mpeg"); // or audio/wav
-
-            using var request = new HttpRequestMessage(HttpMethod.Post, UploadEndpoint)
-            {
-                Content = content
-            };
-
-            // Disable Expect: 100-Continue to avoid extra round-trip in some environments.
-            request.Headers.ExpectContinue = false;
-
-            HttpResponseMessage response;
-            try
-            {
-                response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogError(ex, "Upload attempt failed to send request.");
-                throw; // Let retry wrapper handle
-            }
-
-            var status = (int)response.StatusCode;
-            string body = await SafeReadBodyAsync(response, ct);
-
-            _logger?.LogInformation("AssemblyAI upload response: {Status} {Reason}; Body: {Body}",
-                status, response.ReasonPhrase, Truncate(body, 500));
-
-            if (!response.IsSuccessStatusCode)
-            {
-                if (status == 401 || status == 403)
-                {
-                    _logger?.LogError("Authorization failed. Check API key and 'authorization' header.");
-                }
-
-                // Non-retryable client errors: 4xx (except 408)
-                if (status >= 400 && status < 500 && status != (int)HttpStatusCode.RequestTimeout)
-                {
-                    throw new InvalidOperationException($"Non-retryable upload error {status}: {response.ReasonPhrase}. Body: {body}");
-                }
-
-                // Transient: 5xx or 408 → let caller retry
-                throw new HttpRequestException($"Transient upload error {status}: {response.ReasonPhrase}. Body: {body}");
-            }
-
-            // Parse upload_url
-            try
-            {
-                using var doc = JsonDocument.Parse(body);
-                if (doc.RootElement.TryGetProperty("upload_url", out var urlProp))
-                {
-                    var uploadUrl = urlProp.GetString();
-                    if (string.IsNullOrWhiteSpace(uploadUrl))
-                        throw new InvalidOperationException("Upload succeeded but upload_url is empty.");
-                    return uploadUrl!;
-                }
-
-                throw new InvalidOperationException($"Upload succeeded but 'upload_url' not found in response: {Truncate(body, 200)}");
-            }
-            catch (JsonException jex)
-            {
-                _logger?.LogError(jex, "Failed to parse upload response JSON. Body: {Body}", Truncate(body, 500));
-                throw new InvalidOperationException($"Upload succeeded but response JSON is invalid: {Truncate(body, 200)}", jex);
-            }
-        }
-
-        private static async Task BackoffDelayAsync(int attempt, int baseDelayMs, Random rng, CancellationToken ct)
-        {
-            var maxDelay = baseDelayMs * (int)Math.Pow(2, attempt);
-            var delay = rng.Next(0, Math.Max(baseDelayMs, maxDelay));
-            await Task.Delay(delay, ct);
-        }
-
-        private static string FormatTime(int ms)
-        {
-            var totalSeconds = ms / 1000;
-            int minutes = totalSeconds / 60;
-            int seconds = totalSeconds % 60;
-            return $"{minutes:D2}:{seconds:D2}";
-        }
-
-        private static string? FormatConfidence(float? value)
-        {
-            if (!value.HasValue) return null;
-            return $"{(value.Value * 100):0.0}%";
-        }
-
-        private static async Task<string> SafeReadBodyAsync(HttpResponseMessage response, CancellationToken ct)
-        {
-            try
-            {
-                return await response.Content.ReadAsStringAsync(ct);
-            }
-            catch
-            {
-                return "<unable to read response body>";
-            }
+            try { return await resp.Content.ReadAsStringAsync(ct); }
+            catch { return "<unable to read body>"; }
         }
 
         private static string Truncate(string? s, int max)
         {
-            if (string.IsNullOrEmpty(s)) return string.Empty;
+            if (string.IsNullOrEmpty(s)) return "";
             return s.Length <= max ? s : s.Substring(0, max) + "...";
         }
     }
