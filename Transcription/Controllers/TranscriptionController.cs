@@ -33,7 +33,7 @@ namespace Transcription.Controllers
         }
 
         [HttpPost]
-        [RequestSizeLimit(250_000_000)] // adjust as needed
+        [RequestSizeLimit(250_000_000)] // 250 mb (can be adjusted according to my needs)
         [Consumes("multipart/form-data")]
         public async Task<IActionResult> Post(IFormFile file, CancellationToken ct)
         {
@@ -47,7 +47,7 @@ namespace Transcription.Controllers
             }
             catch (InvalidOperationException ex)
             {
-                // used by service for upstream API errors (bad payloads, invalid responses, etc.)
+                // used by service for upstream API errors 
                 _logger.LogWarning(ex, "Upstream API returned an error");
                 return StatusCode(502, new ProblemDetails { Title = "Upstream API error", Detail = ex.Message, Status = 502 });
             }

@@ -1,16 +1,17 @@
-﻿using System;
+﻿using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using Transcription.Interfaces;
 using Transcription.Models;
-using System.Collections.Generic;
-using Microsoft.AspNetCore.Http;
+using Transcription.Utils;
 
 namespace Transcription.Services
 {
@@ -29,39 +30,52 @@ namespace Transcription.Services
         }
 
         // New public entrypoint: accepts uploaded file
-        public async Task<SimpleTranscriptDto> TranscribeAsync(IFormFile file, CancellationToken ct = default)
+        public async Task<SimpleTranscriptDto> TranscribeAsync(Microsoft.AspNetCore.Http.IFormFile file, CancellationToken ct = default)
         {
             if (file == null || file.Length == 0)
                 throw new ArgumentException("Uploaded file is null or empty.", nameof(file));
 
-            // create a secure temp file path (preserve extension if available)
+            // create a secure temp file path (preserve extension if present)
             var ext = Path.GetExtension(file.FileName);
             if (string.IsNullOrEmpty(ext)) ext = ".bin";
             var tmpPath = Path.Combine(Path.GetTempPath(), $"assemblyai_{Guid.NewGuid():N}{ext}");
 
             try
             {
-                // Save the IFormFile to disk
+                // Save uploaded IFormFile to temp file (disk)
                 await using (var fs = new FileStream(tmpPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, useAsync: true))
                 {
-                    await file.CopyToAsync(fs, ct);
+                    await file.CopyToAsync(fs, ct).ConfigureAwait(false);
                 }
 
-                // Now call the internal flow that works with file path
-                var uploadUrl = await UploadFileAsync(tmpPath, ct);
-                var transcriptId = await CreateTranscriptAsync(uploadUrl, ct);
-                var root = await PollTranscriptAsync(transcriptId, ct);
+                // 1) Upload file (with retry). UploadFileAsync must return (uploadUrl, attempts, logs)
+                var (uploadUrl, uploadAttempts, uploadLogs) = await UploadFileAsync(tmpPath, ct).ConfigureAwait(false);
 
+                // 2) Create transcript job
+                var transcriptId = await CreateTranscriptAsync(uploadUrl, ct).ConfigureAwait(false);
+
+                // 3) Poll until completed
+                var root = await PollTranscriptAsync(transcriptId, ct).ConfigureAwait(false);
+
+                // 4) Map into DTO
                 var dto = MapTranscript(root);
-                dto.RawJson = JsonSerializer.Serialize(root, _jsonOpts);
+
+                // attach upload diagnostics
+                dto.UploadAttempts = uploadAttempts;
+                dto.Logs = uploadLogs ?? new List<string>();
+
                 return dto;
             }
             finally
             {
-                // Always attempt cleanup (best-effort)
+                // best-effort cleanup of temp file
                 try
                 {
-                    if (File.Exists(tmpPath)) File.Delete(tmpPath);
+                    if (File.Exists(tmpPath))
+                    {
+                        File.Delete(tmpPath);
+                        _logger.LogDebug("Deleted temp file {Path}", tmpPath);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -70,41 +84,63 @@ namespace Transcription.Services
             }
         }
 
+
         // Upload helper that reads the file from disk (no streaming public API)
-        private async Task<string> UploadFileAsync(string filePath, CancellationToken ct)
+        private async Task<(string uploadUrl, int attempts, List<string> logs)> UploadFileAsync(string filePath, CancellationToken ct)
         {
             var client = _httpFactory.CreateClient("assemblyai");
             var url = $"{_opts.BaseUrl.TrimEnd('/')}/upload";
 
-            await using var fs = File.OpenRead(filePath);
-            using var content = new StreamContent(fs);
-            content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-
-            using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
-            var apiKey = (_opts.ApiKey ?? "").Trim();
-            req.Headers.Remove("authorization");
-            req.Headers.Add("authorization", apiKey);
-
-            _logger.LogDebug("Uploading file {File} to {Url}", filePath, url);
-
-            var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-            var body = await SafeRead(resp, ct);
-
-            if (!resp.IsSuccessStatusCode)
+            async Task<string> SingleAttempt()
             {
-                _logger.LogError("Upload failed {Status} {Body}", (int)resp.StatusCode, Truncate(body, 500));
-                throw new InvalidOperationException($"Upload failed: {body}");
+                await using var fs = File.OpenRead(filePath);
+                using var content = new StreamContent(fs);
+                content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+
+                using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+                var apiKey = (_opts.ApiKey ?? "").Trim();
+                req.Headers.Remove("authorization");
+                req.Headers.Add("authorization", apiKey);
+
+                _logger.LogInformation("Sending upload request to AssemblyAI (single attempt).");
+
+                var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+                string body = await SafeRead(resp, ct);
+
+                if (!resp.IsSuccessStatusCode)
+                {
+                    int status = (int)resp.StatusCode;
+                    // Non-retryable: 4xx (client errors) -> throw InvalidOperationException
+                    if (status >= 400 && status < 500)
+                    {
+                        var msg = $"Upload returned non-retryable {status}: {Truncate(body, 500)}";
+                        _logger.LogError(msg);
+                        throw new InvalidOperationException(msg);
+                    }
+
+                    // Treat as transient (5xx etc.) to trigger retry
+                    var transientMsg = $"Upload returned transient status {status}";
+                    _logger.LogWarning(transientMsg);
+                    throw new HttpRequestException(transientMsg);
+                }
+
+                using var doc = JsonDocument.Parse(body);
+                if (doc.RootElement.TryGetProperty("upload_url", out var up))
+                    return up.GetString() ?? throw new InvalidOperationException("Upload returned empty upload_url.");
+                throw new InvalidOperationException("Upload response missing upload_url.");
             }
 
-            using var doc = JsonDocument.Parse(body);
-            if (doc.RootElement.TryGetProperty("upload_url", out var up))
-                return up.GetString() ?? throw new InvalidOperationException("Upload returned empty upload_url.");
-            throw new InvalidOperationException("Upload response missing upload_url.");
-        }
+            // run with retry helper which returns logs and attempts
+            var (result, attempts, logs) = await RetryHelper.RetryAsync(
+                SingleAttempt,
+                _logger,
+                maxAttempts: 5,
+                baseDelayMs: 500,
+                ct: ct
+            );
 
-        // The rest of the service (CreateTranscriptAsync, PollTranscriptAsync, MapTranscript, helpers)
-        // can remain identical to previous implementation — they expect uploadUrl and use request-level auth.
-        // For brevity, paste the previously working methods here (CreateTranscriptAsync, PollTranscriptAsync, MapTranscript, FormatMs, SafeRead, Truncate)
+            return (result, attempts, logs);
+        }
 
         private async Task<string> CreateTranscriptAsync(string uploadUrl, CancellationToken ct)
         {
